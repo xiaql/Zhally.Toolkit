@@ -11,8 +11,17 @@ public static class DragDropExtensions
     private static readonly ConditionalWeakTable<View, IDragDropPayload> dragPayloads = [];
     private static readonly ConditionalWeakTable<GestureRecognizer, ConcurrentDictionary<string, IDragDropPayload>> dropPayloads = [];
 
-    public static void AsDraggable<TSource>(this TSource source, object? sourceAffix = null, Action? sourceCallback = null)
+    public static void AsDraggable<TAnchor, TSource>(this TAnchor anchor, DragDropPayload<TSource> payload)
+        where TAnchor : View
         where TSource : View
+    {
+        payload.Anchor = anchor;
+        var source = payload.View;
+        AttachDragGestureRecognizer(anchor, source);
+        dragPayloads.AddOrUpdate(source, payload);  // 覆盖现有 payload（如果存在）
+    }
+
+    public static void AsDraggable<TSource>(this TSource source, object? sourceAffix = null, Action<View, object?>? sourceCallback = null) where TSource : View
     {
         // 创建并存储 payload
         var payload = new DragDropPayload<TSource>
@@ -21,16 +30,20 @@ public static class DragDropExtensions
             Affix = sourceAffix,
             Callback = sourceCallback
         };
-
-        // 覆盖现有 payload（如果存在）
+        AttachDragGestureRecognizer(source, source);
         dragPayloads.AddOrUpdate(source, payload);
+    }
 
+    private static void AttachDragGestureRecognizer<TAnchor, TSource>(TAnchor anchor, TSource source)
+        where TAnchor : View
+        where TSource : View
+    {
         // 查找或创建 DragGestureRecognizer
-        var dragGesture = source.GestureRecognizers.OfType<DragGestureRecognizer>().FirstOrDefault();
+        var dragGesture = anchor.GestureRecognizers.OfType<DragGestureRecognizer>().FirstOrDefault();
         if (dragGesture == null)
         {
             dragGesture = new DragGestureRecognizer { CanDrag = true };
-            source.GestureRecognizers.Add(dragGesture);
+            anchor.GestureRecognizers.Add(dragGesture);
 
             // 只在首次添加手势时注册事件
             dragGesture.DragStarting += (sender, args) =>
@@ -39,27 +52,52 @@ public static class DragDropExtensions
                 if (dragPayloads.TryGetValue(source, out var dragPayload) && dragPayload is DragDropPayload<TSource> payload)
                 {
                     args.Data.Properties.Add("SourcePayload", payload);
-                    source.Opacity = 0.5;
+                    anchor.Opacity = 0.5;
                 }
             };
         }
     }
 
-    public static void AsDroppable<TTarget>(this TTarget target, object? targetAffix = null, Action? targetCallback = null)
-        where TTarget : View
+    public static void AsDroppable<TTarget>(this TTarget target, DragDropPayload<TTarget> payload) where TTarget : View
     {
-        AsDroppable<View, TTarget>(target, targetAffix, targetCallback);
+        target.AsDroppable<View, TTarget>(payload);
     }
 
-    public static void AsDroppable<TSource, TTarget>(this TTarget target, object? targetAffix = null, Action? targetCallback = null)
+    public static void AsDroppable<TTargetAnchor, TSource, TTarget>(this TTargetAnchor anchor, DragDropPayload<TTarget> payload)
+    where TTargetAnchor : View
+    where TSource : View
+    where TTarget : View
+    {
+        var target = payload.View;
+        var dropGesture = AttachDropGestureRecognizer(anchor, target);
+        RegisterDropPayload<TSource, TTarget>(payload, dropGesture);
+    }
+
+    public static void AsDroppable<TSource, TTarget>(this TTarget target, object? targetAffix = null, Action<View, object?>? targetCallback = null)
         where TSource : View
         where TTarget : View
     {
-        var dropGesture = target.GestureRecognizers.OfType<DropGestureRecognizer>().FirstOrDefault();
-        if (dropGesture is null)
+        // 创建并存储 payload
+        var payload = new DragDropPayload<TTarget>
         {
-            dropGesture = new DropGestureRecognizer() { AllowDrop = true };
-            target.GestureRecognizers.Add(dropGesture);
+            View = target,
+            Affix = targetAffix,
+            Callback = targetCallback
+        };
+        var dropGesture = AttachDropGestureRecognizer(target, target);
+        RegisterDropPayload<TSource, TTarget>(payload, dropGesture);
+    }
+
+    private static DropGestureRecognizer AttachDropGestureRecognizer<TAnchor, TTarget>(TAnchor anchor, TTarget target)
+        where TAnchor : View
+        where TTarget : View
+    {
+        // 查找或创建 DropGestureRecognizer
+        var dropGesture = anchor.GestureRecognizers.OfType<DropGestureRecognizer>().FirstOrDefault();
+        if (dropGesture == null)
+        {
+            dropGesture = new DropGestureRecognizer { AllowDrop = true };
+            anchor.GestureRecognizers.Add(dropGesture);
 
             DragDropPayload<TTarget> defaultPayload = new()
             {
@@ -75,26 +113,33 @@ public static class DragDropExtensions
             dropGesture.DragOver += (sender, args) =>
             {
                 bool isSupported = args.Data.Properties.TryGetValue("SourcePayload", out _);
-                target.BackgroundColor = isSupported ? Colors.LightGreen : Colors.Transparent;
+                anchor.BackgroundColor = isSupported ? Colors.LightGreen : Colors.Transparent;
             };
 
             dropGesture.DragLeave += (sender, args) =>
             {
-                target.BackgroundColor = Colors.Transparent;
+                anchor.BackgroundColor = Colors.Transparent;
             };
 
-            dropGesture.Drop += (s, e) => OnDroppablesMessage<TTarget>(target, dropGesture, e);
+            dropGesture.Drop += (s, e) =>
+            {
+                OnDroppablesMessage<TTarget>(target, dropGesture, e);
+                anchor.Opacity = 1;
+                anchor.BackgroundColor = Colors.Transparent;
+            };
+
         }
+        return dropGesture;
+    }
 
-        DragDropPayload<TTarget> sourceSpecificDropPayload = new()
-        {
-            View = target,
-            Affix = targetAffix,
-            Callback = targetCallback
-        };
 
+    private static void RegisterDropPayload<TSource, TTarget>(DragDropPayload<TTarget> payload, DropGestureRecognizer dropGesture)
+        where TSource : View
+        where TTarget : View
+    {
+        TTarget target = payload.View;
         var payloadDict = dropPayloads.GetOrCreateValue(dropGesture);
-        _ = payloadDict.AddOrUpdate(typeof(TSource).Name, (s) => sourceSpecificDropPayload, (s, old) => sourceSpecificDropPayload);
+        _ = payloadDict.AddOrUpdate(typeof(TSource).Name, (s) => payload, (s, old) => payload);
     }
 
     private static void OnDroppablesMessage<TTarget>(TTarget? target, DropGestureRecognizer dropGesture, DropEventArgs e)
@@ -147,6 +192,30 @@ public static class DragDropExtensions
 
         // 视觉反馈
         sourcePayload.View.Opacity = 1;
+        if (sourcePayload.Anchor is not null)
+        {
+            sourcePayload.Anchor.Opacity = 1;
+        }
         target.BackgroundColor = Colors.Transparent;
+    }
+
+    public static void Undraggable<TSource>(this TSource source) where TSource : View
+    {
+        var dragGestureRecognizers = source.GestureRecognizers.OfType<DragGestureRecognizer>().ToList();
+
+        foreach (var recognizer in dragGestureRecognizers)
+        {
+            _ = source.GestureRecognizers.Remove(recognizer);
+        }
+    }
+
+    public static void Undroppable<TTarget>(this TTarget source) where TTarget : View
+    {
+        var dragGestureRecognizers = source.GestureRecognizers.OfType<DropGestureRecognizer>().ToList();
+
+        foreach (var recognizer in dragGestureRecognizers)
+        {
+            _ = source.GestureRecognizers.Remove(recognizer);
+        }
     }
 }
