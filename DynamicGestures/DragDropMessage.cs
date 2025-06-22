@@ -1,5 +1,4 @@
-﻿namespace Zhally.Toolkit.DragDrop;
-
+﻿namespace Zhally.Toolkit.DynamicGestures;
 public interface IDragDropPayload
 {
     public View View { get; }                   // 拖放源/目标控件

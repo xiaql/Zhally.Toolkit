@@ -3,16 +3,57 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
-namespace Zhally.Toolkit.DragDrop;
+namespace Zhally.Toolkit.DynamicGestures;
 
-public static class DragDropExtensions
+public static class DynamicGesturesExtension
 {
     // 使用 ConditionalWeakTable 避免内存泄漏
     private static readonly ConditionalWeakTable<View, IDragDropPayload> dragPayloads = [];
     private static readonly ConditionalWeakTable<GestureRecognizer, ConcurrentDictionary<string, IDragDropPayload>> dropPayloads = [];
 
-    public static void AsDraggable<TAnchor, TSource>(this TAnchor anchor, DragDropPayload<TSource> payload)
-        where TAnchor : View
+    public static void AsPointerPerceptible<TSource>(this TSource source, Action<TSource>? entered = null, Action<TSource>? exited = null) where TSource : View
+    {
+        // 查找或创建 PointerGestureRecognizer
+        var pointerGesture = source.GestureRecognizers.OfType<PointerGestureRecognizer>().FirstOrDefault();
+        if (pointerGesture == null)
+        {
+            pointerGesture = new PointerGestureRecognizer();
+            source.GestureRecognizers.Add(pointerGesture);
+
+            // 只在首次注册时添加手势事件
+            pointerGesture.PointerEntered += (sender, args) =>
+            {
+                if (entered != null)
+                {
+                    entered(source);
+                }
+                else
+                {
+                    source.BackgroundColor = Color.FromArgb("#864605");
+                }
+            };
+
+            pointerGesture.PointerExited += (sender, args) =>
+            {
+                if (exited != null)
+                {
+                    exited(source);
+                }
+                else
+                {
+                    source.BackgroundColor = Colors.Transparent;
+                }
+            };
+
+        }
+    }
+
+    public static void AsDraggable<TSource>(this TSource source, DragDropPayload<TSource> payload) where TSource : View
+    {
+        source.AsDraggable<TSource, TSource>(payload);
+    }
+    public static void AsDraggable<TSourceAnchor, TSource>(this TSourceAnchor anchor, DragDropPayload<TSource> payload)
+        where TSourceAnchor : View
         where TSource : View
     {
         payload.Anchor = anchor;
@@ -21,21 +62,8 @@ public static class DragDropExtensions
         dragPayloads.AddOrUpdate(source, payload);  // 覆盖现有 payload（如果存在）
     }
 
-    public static void AsDraggable<TSource>(this TSource source, object? sourceAffix = null, Action<View, object?>? sourceCallback = null) where TSource : View
-    {
-        // 创建并存储 payload
-        var payload = new DragDropPayload<TSource>
-        {
-            View = source,
-            Affix = sourceAffix,
-            Callback = sourceCallback
-        };
-        AttachDragGestureRecognizer(source, source);
-        dragPayloads.AddOrUpdate(source, payload);
-    }
-
-    private static void AttachDragGestureRecognizer<TAnchor, TSource>(TAnchor anchor, TSource source)
-        where TAnchor : View
+    private static void AttachDragGestureRecognizer<TSourceAnchor, TSource>(TSourceAnchor anchor, TSource source)
+        where TSourceAnchor : View
         where TSource : View
     {
         // 查找或创建 DragGestureRecognizer
@@ -63,33 +91,25 @@ public static class DragDropExtensions
         target.AsDroppable<View, TTarget>(payload);
     }
 
-    public static void AsDroppable<TTargetAnchor, TSource, TTarget>(this TTargetAnchor anchor, DragDropPayload<TTarget> payload)
-    where TTargetAnchor : View
-    where TSource : View
-    where TTarget : View
-    {
-        var target = payload.View;
-        var dropGesture = AttachDropGestureRecognizer(anchor, target);
-        RegisterDropPayload<TSource, TTarget>(payload, dropGesture);
-    }
-
-    public static void AsDroppable<TSource, TTarget>(this TTarget target, object? targetAffix = null, Action<View, object?>? targetCallback = null)
+    public static void AsDroppable<TSource, TTarget>(this TTarget target, DragDropPayload<TTarget> payload)
         where TSource : View
         where TTarget : View
     {
-        // 创建并存储 payload
-        var payload = new DragDropPayload<TTarget>
-        {
-            View = target,
-            Affix = targetAffix,
-            Callback = targetCallback
-        };
-        var dropGesture = AttachDropGestureRecognizer(target, target);
+        target.AsDroppable<TTarget, TSource, TTarget>(payload);
+    }
+
+    public static void AsDroppable<TTargetAnchor, TSource, TTarget>(this TTargetAnchor anchor, DragDropPayload<TTarget> payload)
+        where TTargetAnchor : View
+        where TSource : View
+        where TTarget : View
+    {
+        var target = payload.View;
+        var dropGesture = GetOrAttachDropGestureRecognizer(anchor, target);
         RegisterDropPayload<TSource, TTarget>(payload, dropGesture);
     }
 
-    private static DropGestureRecognizer AttachDropGestureRecognizer<TAnchor, TTarget>(TAnchor anchor, TTarget target)
-        where TAnchor : View
+    private static DropGestureRecognizer GetOrAttachDropGestureRecognizer<TTargetAnchor, TTarget>(TTargetAnchor anchor, TTarget target)
+        where TTargetAnchor : View
         where TTarget : View
     {
         // 查找或创建 DropGestureRecognizer
