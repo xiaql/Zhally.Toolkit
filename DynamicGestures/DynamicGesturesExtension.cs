@@ -5,14 +5,33 @@ using System.Runtime.CompilerServices;
 
 namespace Zhally.Toolkit.DynamicGestures;
 
+
 public static class DynamicGesturesExtension
 {
     // 使用 ConditionalWeakTable 避免内存泄漏
-    private static readonly ConditionalWeakTable<View, IDragDropPayload> dragPayloads = [];
     private static readonly ConditionalWeakTable<GestureRecognizer, ConcurrentDictionary<string, IDragDropPayload>> dropPayloads = [];
+
+    private static readonly ConditionalWeakTable<GuidToken, IDragDropPayload> dragPayloads = [];
+    private static readonly ConcurrentDictionary<string, GuidToken> tempDragStrongReferences = new();
+    private static readonly ConcurrentBag<WeakReference<GuidToken>> guidTokens = [];
+
+    public static void Cleanup()
+    {
+        var deadTokens = guidTokens.Where(t => !t.TryGetTarget(out _)).ToList();
+        foreach (var deadToken in deadTokens)
+        {
+            _ = guidTokens.TryTake(out _);        // 移除已被GC回收的Token引用
+        }
+    }
+    public sealed class GuidToken
+    {
+        public Guid Id { get; } = Guid.NewGuid();
+        public string Token => Id.ToString();
+    }
 
     public static void AsPointerPerceptible<TSource>(this TSource source, Action<TSource>? entered = null, Action<TSource>? exited = null) where TSource : View
     {
+
         // 查找或创建 PointerGestureRecognizer
         var pointerGesture = source.GestureRecognizers.OfType<PointerGestureRecognizer>().FirstOrDefault();
         if (pointerGesture == null)
@@ -48,21 +67,18 @@ public static class DynamicGesturesExtension
         }
     }
 
-    public static void AsDraggable<TSource>(this TSource source, DragDropPayload<TSource> payload) where TSource : View
+    public static void AsDraggable<TSource>(this TSource source, Func<TSource, DragDropPayload<TSource>> payloadCreatorr) where TSource : View
     {
-        source.AsDraggable<TSource, TSource>(payload);
+        source.AsDraggable<TSource, TSource>(source, (source, _) => payloadCreatorr(source));
     }
-    public static void AsDraggable<TSourceAnchor, TSource>(this TSourceAnchor anchor, DragDropPayload<TSource> payload)
+    public static void AsDraggable<TSourceAnchor, TSource>(this TSourceAnchor anchor, TSource source, Func<TSourceAnchor, TSource, DragDropPayload<TSource>> payloadCreator)
         where TSourceAnchor : View
         where TSource : View
     {
-        payload.Anchor = anchor;
-        var source = payload.View;
-        AttachDragGestureRecognizer(anchor, source);
-        dragPayloads.AddOrUpdate(source, payload);  // 覆盖现有 payload（如果存在）
+        AttachDragGestureRecognizer(anchor, source, payloadCreator); // 覆盖现有 payload（如果存在）
     }
 
-    private static void AttachDragGestureRecognizer<TSourceAnchor, TSource>(TSourceAnchor anchor, TSource source)
+    private static void AttachDragGestureRecognizer<TSourceAnchor, TSource>(TSourceAnchor anchor, TSource source, Func<TSourceAnchor, TSource, DragDropPayload<TSource>> payloadCreator)
         where TSourceAnchor : View
         where TSource : View
     {
@@ -74,18 +90,48 @@ public static class DynamicGesturesExtension
             anchor.GestureRecognizers.Add(dragGesture);
 
             // 只在首次添加手势时注册事件
+            GuidToken dragPayloadToken = new();
+            guidTokens.Add(new WeakReference<GuidToken>(dragPayloadToken));
             dragGesture.DragStarting += (sender, args) =>
             {
-                // 通过 dragPayloads 提取最新的 payload
-                if (dragPayloads.TryGetValue(source, out var dragPayload) && dragPayload is DragDropPayload<TSource> payload)
-                {
-                    args.Data.Properties.Add("SourcePayload", payload);
-                    anchor.Opacity = 0.5;
-                }
+                DragDropPayload<TSource> dragPayload = payloadCreator(anchor, source);
+                dragPayloads.Add(dragPayloadToken, dragPayload);
+                tempDragStrongReferences[dragPayloadToken.Token] = dragPayloadToken;
+
+                args.Data.Text = dragPayloadToken.Token;
+                anchor.Opacity = 0.5;
+            };
+
+            dragGesture.DropCompleted += (sender, args) =>
+            {
+                _ = tempDragStrongReferences.TryRemove(dragPayloadToken.Token, out _);
             };
         }
     }
 
+    private static bool RemoveDragPayloadReference(string token)
+    {
+        if (string.IsNullOrEmpty(token))
+            return false;
+
+        if (tempDragStrongReferences.TryGetValue(token, out var guilToken))
+        {
+            _ = tempDragStrongReferences.TryRemove(token, out _);
+
+            return dragPayloads.Remove(guilToken);
+        }
+
+        // 如果强引用已移除，尝试遍历弱引用表查找并移除
+        foreach (var wref in guidTokens)
+        {
+            if (wref.TryGetTarget(out var guidToken) && guidToken.Token == token)
+            {
+                return dragPayloads.Remove(guidToken);
+            }
+        }
+
+        return false;
+    }
     public static void AsDroppable<TTarget>(this TTarget target, DragDropPayload<TTarget> payload) where TTarget : View
     {
         target.AsDroppable<View, TTarget>(payload);
@@ -112,7 +158,6 @@ public static class DynamicGesturesExtension
         where TTargetAnchor : View
         where TTarget : View
     {
-        // 查找或创建 DropGestureRecognizer
         var dropGesture = anchor.GestureRecognizers.OfType<DropGestureRecognizer>().FirstOrDefault();
         if (dropGesture == null)
         {
@@ -130,9 +175,10 @@ public static class DynamicGesturesExtension
                 .GetOrCreateValue(dropGesture)
                 .GetOrAdd(typeof(View).Name, _ => defaultPayload);
 
-            dropGesture.DragOver += (sender, args) =>
+            dropGesture.DragOver += (sender, e) =>
             {
-                bool isSupported = args.Data.Properties.TryGetValue("SourcePayload", out _);
+                string token = e.Data.Text;
+                bool isSupported = tempDragStrongReferences.TryGetValue(token, out _);
                 anchor.BackgroundColor = isSupported ? Colors.LightGreen : Colors.Transparent;
             };
 
@@ -141,9 +187,9 @@ public static class DynamicGesturesExtension
                 anchor.BackgroundColor = Colors.Transparent;
             };
 
-            dropGesture.Drop += (s, e) =>
+            dropGesture.Drop += async (s, e) =>
             {
-                OnDroppablesMessage<TTarget>(target, dropGesture, e);
+                await OnDroppablesMessageAsync<TTarget>(target, dropGesture, e);
                 anchor.Opacity = 1;
                 anchor.BackgroundColor = Colors.Transparent;
             };
@@ -162,15 +208,21 @@ public static class DynamicGesturesExtension
         _ = payloadDict.AddOrUpdate(typeof(TSource).Name, (s) => payload, (s, old) => payload);
     }
 
-    private static void OnDroppablesMessage<TTarget>(TTarget? target, DropGestureRecognizer dropGesture, DropEventArgs e)
+    private static async Task OnDroppablesMessageAsync<TTarget>(TTarget? target, DropGestureRecognizer dropGesture, DropEventArgs e)
      where TTarget : View
     {
-        if (target is null || !e.Data.Properties.TryGetValue("SourcePayload", out var payloadObj))
+        string token = await e.Data.GetTextAsync();
+        bool isSourcePayload = tempDragStrongReferences.TryGetValue(token, out var guidToken);
+        if (target is null || !isSourcePayload)
         {
             return;
         }
 
-        IDragDropPayload sourcePayload = (IDragDropPayload)payloadObj!;
+        _ = dragPayloads.TryGetValue(guidToken!, out IDragDropPayload? sourcePayload);
+        if (sourcePayload is null)
+        {
+            return;
+        }
         Type sourceType = sourcePayload.View.GetType();
 
         if (!dropPayloads.TryGetValue(dropGesture, out var payloadDict))
@@ -217,6 +269,8 @@ public static class DynamicGesturesExtension
             sourcePayload.Anchor.Opacity = 1;
         }
         target.BackgroundColor = Colors.Transparent;
+
+        _ = RemoveDragPayloadReference(token);
     }
 
     public static void Undraggable<TSource>(this TSource source) where TSource : View
